@@ -1,5 +1,5 @@
 #include <stdlib.h>
-#include <time.h>
+#include <unistd.h>
 
 #include <rte_eal.h>
 #include <rte_common.h>
@@ -13,7 +13,6 @@
 #include <rte_malloc.h>
 
 #include "./batch_queue_message.h"
-
 
 #define NB_MBUFS 8191
 #define RX_RING_SIZE 1024
@@ -70,7 +69,7 @@ static int check_link_status(int port_id)
     return 0;
 }
 
-int batch = 0;
+static int batch_seq_number = 0;
 static struct rte_ring* batches_queue;
 
 static int lcore_main(__rte_unused void *arg)
@@ -81,29 +80,29 @@ static int lcore_main(__rte_unused void *arg)
     while(!force_quit)
     {
         struct rte_mbuf** pckt_buffer = (struct rte_mbuf**)rte_malloc(NULL, sizeof(struct rte_mbuf*) * BURST_SIZE, 0);
-        
         u_int16_t nb_rx = rte_eth_rx_burst(0, 0, pckt_buffer, BURST_SIZE);
 
         if (unlikely(nb_rx <= 0)){
             rte_free(pckt_buffer);
             continue;
         }
+        
+        RTE_LOG(INFO, APP, "[lcore_main] - Packets receive in burst %d: %d\n", batch_seq_number, nb_rx);
 
         RTE_LOG(DEBUG, APP, "[lcore_main] - Allocating message\n");
         struct batch_queue_message* message = (struct batch_queue_message*)rte_malloc(NULL, sizeof(struct batch_queue_message), 0);
         RTE_LOG(DEBUG, APP, "[lcore_main] - Message allocated\n");
         
-        RTE_LOG(INFO, APP, "[lcore_main] - Packets receive in burst %d: %d\n", batch, nb_rx);
-        
-        message->batch_number = batch;
-        message->batch = pckt_buffer;
+        message->batch_number = batch_seq_number;
         message->batch_size = nb_rx;
+        message->batch = pckt_buffer;
 
         RTE_LOG(INFO, APP, "[lcore_main] - Enqueuing batch\n");
         rte_ring_enqueue(batches_queue, message);
         RTE_LOG(INFO, APP, "[lcore_main] - Batch enqueued\n");
 
-        batch++;
+        batch_seq_number++;
+        sleep(3);
     }
 
     RTE_LOG(INFO, APP, "lcore main finished\n");
@@ -111,7 +110,7 @@ static int lcore_main(__rte_unused void *arg)
     return 0;
 }
 
-static int lcore_packet_processing(__rte_unused void* arg)
+_Noreturn static int lcore_packet_processing(__rte_unused void* arg)
 {
     RTE_LOG(INFO, APP, "[lcore_packet_processing] - Packet processing starting\n");
     
@@ -123,9 +122,11 @@ static int lcore_packet_processing(__rte_unused void* arg)
         if (dequeue != 0)
             continue;
 
+        RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch dequeue successfully\n");
+
         struct batch_queue_message* batch_message = (struct batch_queue_message*) message;
         
-        RTE_LOG(DEBUG, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
+        RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
         
         for (int i = 0; i < batch_message->batch_size; i++)
         {
@@ -188,8 +189,7 @@ int main(int argc, char **argv)
     rte_eal_remote_launch(lcore_packet_processing, NULL, 2);
 
     rte_eal_mp_wait_lcore();
-
-    /* clean up the EAL */
+    
     rte_eal_cleanup();
 
     return 0;
