@@ -5,7 +5,8 @@
 APP = yadns
 
 # all source are stored in SRCS-y
-SRCS-y := main.c
+SRCS-y := $(wildcard src/*.c)
+HDRS-y := $(wildcard src/*.h)
 
 # --- MODIFICATION START ---
 # Path to the static cryptopANT library installation.
@@ -43,7 +44,7 @@ LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk) -L$(CRYPTOPANT_DIR)/lib -lcr
 # Add cryptopANT library path (-L) and library names (-l) for the static build.
 # We also add -lcrypto because libcryptopANT depends on it.
 # Corrected -lcryptopANT case to match the actual filename libcryptopANT.a
-LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk) -L$(CRYPTOPANT_DIR)/lib -lcryptopANT -lcrypto
+LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk) -L$(CRYPTOPANT_DIR)/lib -lcryptopANT
 # --- MODIFICATION END ---
 
 
@@ -58,13 +59,13 @@ endif
 CFLAGS += -DALLOW_EXPERIMENTAL_API
 CFLAGS_DEBUG += -DALLOW_EXPERIMENTAL_API
 
-build/$(APP)-shared: $(SRCS-y) Makefile $(PC_FILE) | build
+build/$(APP)-shared: $(SRCS-y) $(HDRS-y) Makefile $(PC_FILE) | build
 	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_SHARED)
 
-build/$(APP)-static: $(SRCS-y) Makefile $(PC_FILE) | build
+build/$(APP)-static: $(SRCS-y) $(HDRS-y) Makefile $(PC_FILE) | build
 	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_STATIC)
 
-build/$(APP)-static-debug: $(SRCS-y) Makefile $(PC_FILE) | build
+build/$(APP)-static-debug: $(SRCS-y) $(HDRS-y) Makefile $(PC_FILE) | build
 	$(CC) $(CFLAGS_DEBUG) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_STATIC)
 
 build:
