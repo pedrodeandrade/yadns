@@ -7,6 +7,12 @@ APP = yadns
 # all source are stored in SRCS-y
 SRCS-y := main.c
 
+# --- MODIFICATION START ---
+# Path to the static cryptopANT library installation.
+# $(CURDIR) makes the path relative to this Makefile's location.
+CRYPTOPANT_DIR = $(CURDIR)/lib/install/cryptopANT
+# --- MODIFICATION END ---
+
 PKGCONF ?= pkg-config
 
 # Build using pkg-config variables if possible
@@ -14,7 +20,7 @@ ifneq ($(shell $(PKGCONF) --exists libdpdk && echo 0),0)
 $(error "no installation of DPDK found")
 endif
 
-all: shared
+all: static
 .PHONY: shared static static-debug
 shared: build/$(APP)-shared
 	ln -sf $(APP)-shared build/$(APP)
@@ -24,10 +30,22 @@ static-debug: build/$(APP)-static-debug
 	ln -sf $(APP)-static-debug build/$(APP)
 
 PC_FILE := $(shell $(PKGCONF) --path libdpdk 2>/dev/null)
-CFLAGS += -O3 $(shell $(PKGCONF) --cflags libdpdk)
-CFLAGS_DEBUG = -g -O0 -DDEBUG $(shell $(PKGCONF) --cflags libdpdk)
-LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk)
-LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk)
+
+# --- MODIFICATION START ---
+# Add the cryptopANT include path to CFLAGS for all builds
+CFLAGS += -O3 $(shell $(PKGCONF) --cflags libdpdk) -I$(CRYPTOPANT_DIR)/include
+CFLAGS_DEBUG = -g -O0 -DDEBUG $(shell $(PKGCONF) --cflags libdpdk) -I$(CRYPTOPANT_DIR)/include
+
+# Add cryptopANT flags to shared builds as well, in case you need them later
+# Corrected -lcryptopANT case
+LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk) -L$(CRYPTOPANT_DIR)/lib -lcryptopANT -lcrypto
+
+# Add cryptopANT library path (-L) and library names (-l) for the static build.
+# We also add -lcrypto because libcryptopANT depends on it.
+# Corrected -lcryptopANT case to match the actual filename libcryptopANT.a
+LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk) -L$(CRYPTOPANT_DIR)/lib -lcryptopANT -lcrypto
+# --- MODIFICATION END ---
+
 
 ifneq (,$(filter static static-debug,$(MAKECMDGOALS)))
 # check for broken pkg-config
