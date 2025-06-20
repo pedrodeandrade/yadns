@@ -1,5 +1,13 @@
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <signal.h>
+#include <sys/uio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
 
 #include <rte_eal.h>
 #include <rte_common.h>
@@ -11,19 +19,39 @@
 #include <rte_ether.h>
 #include <rte_cycles.h>
 #include <rte_malloc.h>
+#include <rte_pcapng.h>
+#include <rte_errno.h>
 
-#include "./batch_queue_message.h"
+#include "batch_queue_message.h"
 
 #define NB_MBUFS 8191
 #define RX_RING_SIZE 1024
 #define BURST_SIZE 64
-#define MBUF_CACHE_SIZE (BURST_SIZE * 1.5)
+#define MBUF_CACHE_SIZE (BURST_SIZE * 4)
 #define RTE_LOGTYPE_APP RTE_LOGTYPE_USER1
 #define TOTAL_RX_QUEUES 1
+#  define SSIZE_MAX	LONG_MAX
 
 static volatile bool force_quit;
+static struct rte_mempool* mbuf_pool_persist;
+static int closing_pcap = 0;
+rte_pcapng_t* pcapng;
 
-static int init_port(u_int16_t port,struct rte_mempool *mbuf_pool){
+void gracefully_shutdown(int signal)
+{
+    if (signal != SIGINT && signal != SIGTERM)
+        return;
+
+    if (pcapng != NULL)
+    {
+        closing_pcap = 1;
+        RTE_LOG(INFO,APP,"\n ---- CLOSING PCAPNG ----");
+        rte_pcapng_close(pcapng);
+    }
+}
+
+
+static int init_port(u_int16_t port,struct rte_mempool* mbuf_pool){
     struct rte_ether_addr addr;
     
     rte_eth_macaddr_get(port, &addr);
@@ -110,7 +138,7 @@ static int lcore_main(__rte_unused void *arg)
     return 0;
 }
 
-_Noreturn static int lcore_packet_processing(__rte_unused void* arg)
+static int lcore_packet_processing(__rte_unused void* arg)
 {
     RTE_LOG(INFO, APP, "[lcore_packet_processing] - Packet processing starting\n");
     
@@ -128,10 +156,57 @@ _Noreturn static int lcore_packet_processing(__rte_unused void* arg)
         
         RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
         
-        for (int i = 0; i < batch_message->batch_size; i++)
-        {
+        // TODO PROCESSING
+        
+        // TODO PUT THE MESSAGE IN THE STORAGE RING
+    }
+}
+
+static int lcore_packet_persist(__rte_unused void* args){
+    RTE_LOG(INFO, APP, "[lcore_packet_processing] - Packet storage starting\n");
+
+    while (1)
+    {
+        void* message;
+
+        // TODO Retrieve the packets from the appropriate queue
+        int dequeue = rte_ring_dequeue(batches_queue, &message);
+        if (dequeue != 0)
+            continue;
+
+        RTE_LOG(INFO, APP, "[lcore_packet_processing] - Storage dequeue successfully\n");
+
+        struct batch_queue_message* batch_message = (struct batch_queue_message*)message;
+
+        RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
+
+        struct rte_mbuf* mbufs_persist[batch_message->batch_size];
+
+        for (int i = 0; i < batch_message->batch_size; i++){
+            mbufs_persist[i] = rte_pcapng_copy(
+                    0,
+                    0,
+                    batch_message->batch[i],
+                    mbuf_pool_persist,
+                    UINT32_MAX,
+                    RTE_PCAPNG_DIRECTION_IN,
+                    NULL
+            );
+
+            if (mbufs_persist[i] == NULL){
+                RTE_LOG(ERR, APP, "[lcore_packet_processing] - Error copying packet %d from batch %d", i, batch_message->batch_number);
+                rte_exit(1, "fodas4");
+            }
+
             rte_pktmbuf_free(batch_message->batch[i]);
         }
+
+        if (closing_pcap == 1)
+            return 0;
+
+        ssize_t packets_persisted = rte_pcapng_write_packets(pcapng, mbufs_persist, batch_message->batch_size);
+        if (packets_persisted == -1)
+            RTE_LOG(ERR, APP, "[lcore_packet_processing] - Error persistin packets to pcapng file ERRNO %s", rte_strerror(rte_errno));
     }
 }
 
@@ -155,17 +230,30 @@ int main(int argc, char **argv)
     RTE_LOG(INFO, APP, "Number of ports:%u\n", ports_number);
 
     /* Create a new mbuf mempool */
-    struct rte_mempool * mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL",
+    struct rte_mempool* mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL",
         NB_MBUFS,
         MBUF_CACHE_SIZE,
         0, 
         RTE_MBUF_DEFAULT_BUF_SIZE,
         rte_socket_id());
 
+    int port_id = 0;
+    
+    struct rte_eth_dev_info dev_info = {};
+    if (rte_eth_dev_info_get(port_id, &dev_info) != 0) {
+        rte_exit(EXIT_FAILURE, "Failed to get device info for port %u\n", port_id);
+    }
+    
+
+    mbuf_pool_persist = rte_pktmbuf_pool_create("MBUF_POOL_PERSIST",
+        NB_MBUFS,
+        MBUF_CACHE_SIZE,
+        0,
+        RTE_MBUF_DEFAULT_BUF_SIZE + 28, // TODO DECLARE 28 AS A MACRO, IT'S THE EXTRA SIZE REQUIRED BY THE PCAPNG FORMAT
+        rte_socket_id());
+
     if (mbuf_pool == NULL)
         rte_exit(EXIT_FAILURE,"mbuff_pool create failed\n");
-
-    int port_id = 0;
     
     if(init_port(port_id, mbuf_pool) != 0)
         rte_exit(EXIT_FAILURE,"port init failed\n");
@@ -182,8 +270,25 @@ int main(int argc, char **argv)
         RTE_LOG(ERR,APP,"Some ports are down\n");
 
     RTE_LOG(INFO, APP, "%d lcore available\n", rte_lcore_count());
+    
+    // TODO Get the file name from the app parameters
+    FILE* output = fopen("dump/teste.pcapng", "w");
+    if (output == NULL)
+        rte_exit(EXIT_FAILURE, "error creating file to persist packets");
+
+    int fd = fileno(output);
+    pcapng = rte_pcapng_fdopen(fd, NULL, NULL, NULL, NULL);
+    if (pcapng == NULL)
+        rte_exit(EXIT_FAILURE, "error opening the file to persist packets");
+
+    if (rte_pcapng_add_interface(pcapng, port_id, NULL, NULL, NULL) < 0)
+        rte_exit(EXIT_FAILURE, "error adding interface");
+
+    RTE_LOG(INFO, APP, "FD NUMBER %d\n", fd);
 
     batches_queue = rte_ring_create("BATCHES_RING", 32, rte_socket_id(), RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
+
+    signal(SIGTERM, gracefully_shutdown);
 
     rte_eal_remote_launch(lcore_main, NULL, 1);
     rte_eal_remote_launch(lcore_packet_processing, NULL, 2);
