@@ -21,6 +21,8 @@
 #include <rte_malloc.h>
 #include <rte_pcapng.h>
 #include <rte_errno.h>
+#include <cryptopANT.h>
+#include <netinet/in.h>
 
 #include "batch_queue_message.h"
 
@@ -30,6 +32,8 @@
 #define MBUF_CACHE_SIZE (BURST_SIZE * 4)
 #define RTE_LOGTYPE_APP RTE_LOGTYPE_USER1
 #define TOTAL_RX_QUEUES 1
+#define IPV4_PROTO 2048
+#define IPV6_PROTO 34525
 #  define SSIZE_MAX	LONG_MAX
 
 static volatile bool force_quit;
@@ -97,6 +101,15 @@ static int check_link_status(int port_id)
     return 0;
 }
 
+static u_int16_t get_l3_type(char *pointer)
+{
+    u_int8_t slb= 0;
+    u_int8_t lb= 0;
+    slb= *(pointer - 2);// second last byte of ETH layer
+    lb= *(pointer - 1);// last byte of ETH layer
+    return (slb* 256) +lb;
+}
+
 static int batch_seq_number = 0;
 static struct rte_ring* batches_queue;
 
@@ -110,7 +123,7 @@ static int lcore_main(__rte_unused void *arg)
         struct rte_mbuf** pckt_buffer = (struct rte_mbuf**)rte_malloc(NULL, sizeof(struct rte_mbuf*) * BURST_SIZE, 0);
         u_int16_t nb_rx = rte_eth_rx_burst(0, 0, pckt_buffer, BURST_SIZE);
 
-        if (unlikely(nb_rx <= 0)){
+        if (nb_rx <= 0){
             rte_free(pckt_buffer);
             continue;
         }
@@ -130,7 +143,6 @@ static int lcore_main(__rte_unused void *arg)
         RTE_LOG(INFO, APP, "[lcore_main] - Batch enqueued\n");
 
         batch_seq_number++;
-        sleep(3);
     }
 
     RTE_LOG(INFO, APP, "lcore main finished\n");
@@ -155,12 +167,51 @@ static int lcore_packet_processing(__rte_unused void* arg)
         struct batch_queue_message* batch_message = (struct batch_queue_message*) message;
         
         RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
-        
-        // TODO PROCESSING
+
+        for (int i = 0; i < batch_message->batch_size; i++) {
+            struct rte_mbuf* pkt_buffer = batch_message->batch[i];
+
+            // TODO Calculate timestamp
+            
+            struct rte_ether_hdr* ethernet_header = rte_pktmbuf_mtod(pkt_buffer, struct rte_ether_hdr *);
+
+            void* next_proto_pointer = (void*) ((unsigned char*) ethernet_header + sizeof (struct rte_ether_hdr));
+            u_int16_t next_proto = get_l3_type(next_proto_pointer); // holds last two byte value of ETH Layer
+            
+            if (next_proto == IPV4_PROTO){
+                RTE_LOG(INFO, APP, "[lcore_packet_processing] - IPV4 PACKET ARRIVED\n");
+                
+                struct rte_ipv4_hdr* ipv4_header = rte_pktmbuf_mtod_offset(pkt_buffer, struct rte_ipv4_hdr*, sizeof (struct rte_ether_hdr));
+
+                // BIG-ENDIAN TO LITTLE-ENDIAN (network to host byte order)
+                u_int32_t ip_src = rte_bswap32(ipv4_header->src_addr);
+                u_int32_t ip_dst = rte_bswap32(ipv4_header->dst_addr);
+                
+                ipv4_header->src_addr = scramble_ip4(ip_src, 0);
+                ipv4_header->dst_addr = scramble_ip4(ip_dst, 0);
+            }
+            else if (next_proto == IPV6_PROTO){
+                RTE_LOG(INFO, APP, "[lcore_packet_processing] - IPV6 PACKET ARRIVED\n");
+                
+                struct rte_ipv6_hdr* ipv6_header = rte_pktmbuf_mtod_offset(pkt_buffer, struct rte_ipv6_hdr*, sizeof (struct rte_ether_hdr));
+
+                struct in6_addr ip_src = {};
+                struct in6_addr ip_dst = {};
+                rte_memcpy(ip_src.s6_addr, ipv6_header->src_addr, 16);
+                rte_memcpy(ip_dst.s6_addr, ipv6_header->dst_addr, 16);
+
+                scramble_ip6(&ip_src, 0);
+                scramble_ip6(&ip_dst, 0);
+
+                rte_memcpy(ipv6_header->src_addr, ip_src.s6_addr, 16);
+                rte_memcpy(ipv6_header->dst_addr, ip_dst.s6_addr, 16);
+            }
+        }
         
         // TODO PUT THE MESSAGE IN THE STORAGE RING
     }
 }
+
 
 static int lcore_packet_persist(__rte_unused void* args){
     RTE_LOG(INFO, APP, "[lcore_packet_processing] - Packet storage starting\n");
@@ -244,7 +295,6 @@ int main(int argc, char **argv)
         rte_exit(EXIT_FAILURE, "Failed to get device info for port %u\n", port_id);
     }
     
-
     mbuf_pool_persist = rte_pktmbuf_pool_create("MBUF_POOL_PERSIST",
         NB_MBUFS,
         MBUF_CACHE_SIZE,
@@ -287,6 +337,10 @@ int main(int argc, char **argv)
     RTE_LOG(INFO, APP, "FD NUMBER %d\n", fd);
 
     batches_queue = rte_ring_create("BATCHES_RING", 32, rte_socket_id(), RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
+    int key_created = scramble_init_from_file("config/anom.key", SCRAMBLE_BLOWFISH, SCRAMBLE_BLOWFISH, 0);
+    if (key_created < 0)
+        rte_exit(EXIT_FAILURE, "ERROR CREATING cryptopANT key");
+    
 
     signal(SIGTERM, gracefully_shutdown);
 
