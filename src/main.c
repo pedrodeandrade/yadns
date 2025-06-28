@@ -17,10 +17,11 @@
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_ether.h>
-#include <rte_cycles.h>
 #include <rte_malloc.h>
 #include <rte_pcapng.h>
 #include <rte_errno.h>
+#include <rte_ip.h>
+#include <rte_memcpy.h>
 #include <cryptopANT.h>
 #include <netinet/in.h>
 
@@ -194,17 +195,19 @@ static int lcore_packet_processing(__rte_unused void* arg)
                 RTE_LOG(INFO, APP, "[lcore_packet_processing] - IPV6 PACKET ARRIVED\n");
                 
                 struct rte_ipv6_hdr* ipv6_header = rte_pktmbuf_mtod_offset(pkt_buffer, struct rte_ipv6_hdr*, sizeof (struct rte_ether_hdr));
+                uint8_t* ipv6_src_addr = ipv6_header->src_addr.a;
+                uint8_t* ipv6_dst_addr = ipv6_header->dst_addr.a;
 
-                struct in6_addr ip_src = {};
-                struct in6_addr ip_dst = {};
-                rte_memcpy(ip_src.s6_addr, ipv6_header->src_addr, 16);
-                rte_memcpy(ip_dst.s6_addr, ipv6_header->dst_addr, 16);
+                struct in6_addr anom_ip_src = {};
+                struct in6_addr anom_ip_dst = {};
+                rte_memcpy(anom_ip_src.s6_addr, ipv6_src_addr, sizeof(ipv6_header->src_addr));
+                rte_memcpy(anom_ip_dst.s6_addr, ipv6_dst_addr, sizeof(sizeof(ipv6_header->dst_addr)));
 
-                scramble_ip6(&ip_src, 0);
-                scramble_ip6(&ip_dst, 0);
+                scramble_ip6(&anom_ip_src, 0);
+                scramble_ip6(&anom_ip_dst, 0);
 
-                rte_memcpy(ipv6_header->src_addr, ip_src.s6_addr, 16);
-                rte_memcpy(ipv6_header->dst_addr, ip_dst.s6_addr, 16);
+                rte_memcpy(ipv6_src_addr, anom_ip_src.s6_addr, sizeof(ipv6_header->src_addr));
+                rte_memcpy(ipv6_dst_addr, anom_ip_dst.s6_addr, sizeof(ipv6_header->dst_addr));
             }
         }
         
