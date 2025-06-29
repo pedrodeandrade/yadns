@@ -39,13 +39,13 @@ CFLAGS_DEBUG = -g -O0 -DDEBUG $(shell $(PKGCONF) --cflags libdpdk) -I$(CRYPTOPAN
 
 # Shared build flags - embed runtime library paths
 LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk) \
-                 -L$(CRYPTOPANT_DIR)/lib -L$(OPENSSL_DIR)/lib \
-                 -Wl,-rpath,$(CRYPTOPANT_DIR)/lib -Wl,-rpath,$(OPENSSL_DIR)/lib \
+                 -L$(CRYPTOPANT_DIR)/lib -L$(OPENSSL_DIR)/lib64 \
+                 -Wl,-rpath,$(CRYPTOPANT_DIR)/lib -Wl,-rpath,$(OPENSSL_DIR)/lib64 \
                  -lcryptopANT -lcrypto
 
 # Static build flags (keeping for compatibility)
 LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk) \
-                 -L$(CRYPTOPANT_DIR)/lib -L$(OPENSSL_DIR)/lib \
+                 -L$(CRYPTOPANT_DIR)/lib -L$(OPENSSL_DIR)/lib64 \
                  -lcryptopANT -lcrypto
 # --- MODIFICATION END ---
 
