@@ -1,0 +1,16 @@
+Index: lib/pcapng/version.map
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/pcapng/version.map b/lib/pcapng/version.map
+--- a/lib/pcapng/version.map	(revision Staged)
++++ b/lib/pcapng/version.map	(date 1751157133431)
+@@ -7,6 +7,7 @@
+ 	rte_pcapng_fdopen;
+ 	rte_pcapng_mbuf_size;
+ 	rte_pcapng_write_packets;
++	rte_pcapng_write_packets_with_timestamp;
+ 	rte_pcapng_write_stats;
+ 
+ 	local: *;

@@ -1,0 +1,42 @@
+Index: lib/pcapng/rte_pcapng.h
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/pcapng/rte_pcapng.h b/lib/pcapng/rte_pcapng.h
+--- a/lib/pcapng/rte_pcapng.h	(revision Staged)
++++ b/lib/pcapng/rte_pcapng.h	(date 1751082969072)
+@@ -167,6 +167,33 @@
+ rte_pcapng_write_packets(rte_pcapng_t *self,
+ 			 struct rte_mbuf *pkts[], uint16_t nb_pkts);
+ 
++/**
++ * Write packets to the capture file.
++ *
++ * Packets to be captured are copied by rte_pcapng_copy()
++ * and then this function is called to write them to the file.
++ *
++ * @warning
++ * Do not pass original mbufs from transmit or receive
++ * or file will be invalid pcapng format.
++ *
++ * @param self
++ *  The handle to the packet capture file
++ * @param pkts
++ *  The address of an array of *nb_pkts* pointers to *rte_mbuf* structures
++ *  which contain the output packets
++ * @param nb_pkts
++ *  The number of packets to write to the file.
++ * @param timestamps
++ *  Timestamps from each packet provided as input
++ * @return
++ *  The number of bytes written to file, -1 on failure to write file.
++ *  The mbuf's in *pkts* are always freed.
++ */
++ssize_t
++rte_pcapng_write_packets_with_timestamps(rte_pcapng_t *self,
++                         struct rte_mbuf *pkts[], uint16_t nb_pkts, uint64_t timestamps[]);
++
+ /**
+  * Write an Interface statistics block.
+  * For statistics, use 0 if don't know or care to report it.

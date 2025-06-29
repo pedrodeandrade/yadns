@@ -1,0 +1,55 @@
+Index: lib/pcapng/rte_pcapng.c
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/lib/pcapng/rte_pcapng.c b/lib/pcapng/rte_pcapng.c
+--- a/lib/pcapng/rte_pcapng.c	(revision Staged)
++++ b/lib/pcapng/rte_pcapng.c	(date 1751088371875)
+@@ -607,9 +607,9 @@
+ }
+ 
+ /* Write pre-formatted packets to file. */
+-ssize_t
+-rte_pcapng_write_packets(rte_pcapng_t *self,
+-			 struct rte_mbuf *pkts[], uint16_t nb_pkts)
++static ssize_t
++rte_pcapng_write_packets_core(rte_pcapng_t *self,
++			 struct rte_mbuf *pkts[], uint16_t nb_pkts, uint64_t timestamps[], int use_external_timestamps)
+ {
+ 	struct iovec iov[IOV_MAX];
+ 	unsigned int i, cnt = 0;
+@@ -638,7 +638,9 @@
+ 		/* adjust timestamp recorded in packet */
+ 		cycles = (uint64_t)epb->timestamp_hi << 32;
+ 		cycles += epb->timestamp_lo;
+-		timestamp = pcapng_timestamp(self, cycles);
++		timestamp = use_external_timestamps
++            ? timestamps[i]
++            : pcapng_timestamp(self, cycles);
+ 		epb->timestamp_hi = timestamp >> 32;
+ 		epb->timestamp_lo = (uint32_t)timestamp;
+ 
+@@ -675,6 +677,22 @@
+ 	return total + ret;
+ }
+ 
++/* Write pre-formatted packets to file. */
++ssize_t
++rte_pcapng_write_packets(rte_pcapng_t *self,
++                              struct rte_mbuf *pkts[], uint16_t nb_pkts)
++{
++    return rte_pcapng_write_packets_core(self, pkts, nb_pkts, NULL, 0);
++}
++
++/* Write pre-formatted packets to file with external timestamps. */
++ssize_t
++rte_pcapng_write_packets_with_timestamps(rte_pcapng_t *self,
++                              struct rte_mbuf *pkts[], uint16_t nb_pkts, uint64_t timestamps[])
++{
++    return rte_pcapng_write_packets_core(self, pkts, nb_pkts, timestamps, 1);    
++}
++
+ /* Create new pcapng writer handle */
+ rte_pcapng_t *
+ rte_pcapng_fdopen(int fd,
