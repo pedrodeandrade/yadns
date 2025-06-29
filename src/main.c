@@ -22,8 +22,10 @@
 #include <rte_errno.h>
 #include <rte_ip.h>
 #include <rte_memcpy.h>
+#include <rte_cycles.h>
 #include <cryptopANT.h>
 #include <netinet/in.h>
+#include <time.h>
 
 #include "batch_queue_message.h"
 
@@ -35,12 +37,60 @@
 #define TOTAL_RX_QUEUES 1
 #define IPV4_PROTO 2048
 #define IPV6_PROTO 34525
+#define NSEC_PER_SEC 1000000000L
+#define MIN_PACKET_SIZE_BYTES 64
+#define MAX_PACKET_SIZE_BYTES 1518
+#define INTER_PACKET_GAP_BYTES 12
+#define BITS_PER_BYTE 8
 #  define SSIZE_MAX	LONG_MAX
 
 static volatile bool force_quit;
 static struct rte_mempool* mbuf_pool_persist;
 static int closing_pcap = 0;
-rte_pcapng_t* pcapng;
+static rte_pcapng_t* pcapng;
+static uint64_t  init_packet_processing_nsec;
+static uint64_t  epoch_time_offset;
+static uint64_t  interbatch_packet_interval[MAX_PACKET_SIZE_BYTES];
+static int batch_seq_number = 0;
+static struct rte_ring* batches_queue;
+
+static void init_capture_timers()
+{
+    struct timespec ts;
+    uint64_t cycles = rte_get_tsc_cycles();
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    init_packet_processing_nsec = (cycles + rte_get_tsc_cycles()) / 2; // average btw two cycles capture
+    epoch_time_offset = ((uint64_t) ts.tv_sec * NSEC_PER_SEC) + ts.tv_nsec; // struct timespec to nanosecond
+}
+
+static void init_interbatch_interval_array()
+{
+    for (int i = 0; i < MAX_PACKET_SIZE_BYTES; ++i) {
+        int packet_size_bytes = i + 1;
+        
+        if (packet_size_bytes < MIN_PACKET_SIZE_BYTES)
+            packet_size_bytes = MIN_PACKET_SIZE_BYTES;
+        
+        interbatch_packet_interval[i] = ((packet_size_bytes + INTER_PACKET_GAP_BYTES) * BITS_PER_BYTE) / 10;
+    }
+}
+
+// get the cycles diff between the baseline and now and add with epoch offset to get current timestamp
+static uint64_t get_current_timestamp_nsec()
+{
+    uint64_t cycles = rte_get_tsc_cycles();
+    const uint64_t hz = rte_get_tsc_hz();
+
+    uint64_t delta = cycles - init_packet_processing_nsec;
+
+    /* Avoid numeric wraparound by computing seconds first */
+    uint64_t secs = delta / hz;
+    uint64_t rem = delta % hz;
+    uint64_t ns = (rem * NS_PER_S) / hz;
+
+    return secs * NS_PER_S + ns + epoch_time_offset;
+}
 
 void gracefully_shutdown(int signal)
 {
@@ -54,7 +104,6 @@ void gracefully_shutdown(int signal)
         rte_pcapng_close(pcapng);
     }
 }
-
 
 static int init_port(u_int16_t port,struct rte_mempool* mbuf_pool){
     struct rte_ether_addr addr;
@@ -111,9 +160,6 @@ static u_int16_t get_l3_type(char *pointer)
     return (slb* 256) +lb;
 }
 
-static int batch_seq_number = 0;
-static struct rte_ring* batches_queue;
-
 static int lcore_main(__rte_unused void *arg)
 {
     unsigned int lcore_id = rte_lcore_id();
@@ -123,11 +169,13 @@ static int lcore_main(__rte_unused void *arg)
     {
         struct rte_mbuf** pckt_buffer = (struct rte_mbuf**)rte_malloc(NULL, sizeof(struct rte_mbuf*) * BURST_SIZE, 0);
         u_int16_t nb_rx = rte_eth_rx_burst(0, 0, pckt_buffer, BURST_SIZE);
-
+        
         if (nb_rx <= 0){
             rte_free(pckt_buffer);
             continue;
         }
+        
+        uint64_t batch_arrival_timestamp = get_current_timestamp_nsec();
         
         RTE_LOG(INFO, APP, "[lcore_main] - Packets receive in burst %d: %d\n", batch_seq_number, nb_rx);
 
@@ -138,6 +186,7 @@ static int lcore_main(__rte_unused void *arg)
         message->batch_number = batch_seq_number;
         message->batch_size = nb_rx;
         message->batch = pckt_buffer;
+        message->timestamp_nsec = batch_arrival_timestamp;
 
         RTE_LOG(INFO, APP, "[lcore_main] - Enqueuing batch\n");
         rte_ring_enqueue(batches_queue, message);
@@ -166,13 +215,18 @@ static int lcore_packet_processing(__rte_unused void* arg)
         RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch dequeue successfully\n");
 
         struct batch_queue_message* batch_message = (struct batch_queue_message*) message;
+        uint64_t* pkts_timestamps = (uint64_t*)rte_malloc(NULL, sizeof(uint64_t) * batch_message->batch_size, 0);
         
         RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
 
         for (int i = 0; i < batch_message->batch_size; i++) {
             struct rte_mbuf* pkt_buffer = batch_message->batch[i];
 
-            // TODO Calculate timestamp
+            // first packet receives the timestamp of the batch
+            if (unlikely(i == 0))
+                pkts_timestamps[i] = batch_message->timestamp_nsec;
+            else
+                pkts_timestamps[i] = pkts_timestamps[i - 1] + interbatch_packet_interval[pkt_buffer->data_len];
             
             struct rte_ether_hdr* ethernet_header = rte_pktmbuf_mtod(pkt_buffer, struct rte_ether_hdr *);
 
@@ -210,8 +264,6 @@ static int lcore_packet_processing(__rte_unused void* arg)
                 rte_memcpy(ipv6_dst_addr, anom_ip_dst.s6_addr, sizeof(ipv6_header->dst_addr));
             }
         }
-        
-        // TODO PUT THE MESSAGE IN THE STORAGE RING
     }
 }
 
@@ -268,6 +320,9 @@ int main(int argc, char **argv)
 {
     force_quit = false;
     int return_status;
+
+    init_interbatch_interval_array();
+    init_capture_timers();
 
     /* The EAL arguments are passed when calling the program */
     int parsed_eal_args = rte_eal_init(argc, argv);
@@ -346,6 +401,7 @@ int main(int argc, char **argv)
     
 
     signal(SIGTERM, gracefully_shutdown);
+    signal(SIGINT, gracefully_shutdown);
 
     rte_eal_remote_launch(lcore_main, NULL, 1);
     rte_eal_remote_launch(lcore_packet_processing, NULL, 2);
