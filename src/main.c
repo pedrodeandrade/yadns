@@ -7,8 +7,6 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
-
 #include <rte_eal.h>
 #include <rte_common.h>
 #include <rte_ethdev.h>
@@ -17,7 +15,6 @@
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_ether.h>
-#include <rte_malloc.h>
 #include <rte_pcapng.h>
 #include <rte_errno.h>
 #include <rte_ip.h>
@@ -29,18 +26,19 @@
 
 #include "batch_queue_message.h"
 
-#define NB_MBUFS 8191
+#define MAX_CONCURRENT_BATCHES 128
+#define BATCH_SIZE 32
+#define NB_MBUFS MAX_CONCURRENT_BATCHES * BATCH_SIZE
 #define RX_RING_SIZE 1024
-#define BURST_SIZE 64
-#define MBUF_CACHE_SIZE (BURST_SIZE * 4)
+#define MBUF_CACHE_SIZE (BATCH_SIZE * 4)
 #define RTE_LOGTYPE_APP RTE_LOGTYPE_USER1
 #define TOTAL_RX_QUEUES 1
 #define IPV4_PROTO 2048
 #define IPV6_PROTO 34525
-#define NSEC_PER_SEC 1000000000L
 #define MIN_PACKET_SIZE_BYTES 64
 #define MAX_PACKET_SIZE_BYTES 1518
 #define INTER_PACKET_GAP_BYTES 12
+#define BATCHES_QUEUE_SIZE 32
 #define BITS_PER_BYTE 8
 #  define SSIZE_MAX	LONG_MAX
 
@@ -61,7 +59,7 @@ static void init_capture_timers()
     clock_gettime(CLOCK_REALTIME, &ts);
 
     init_packet_processing_nsec = (cycles + rte_get_tsc_cycles()) / 2; // average btw two cycles capture
-    epoch_time_offset = ((uint64_t) ts.tv_sec * NSEC_PER_SEC) + ts.tv_nsec; // struct timespec to nanosecond
+    epoch_time_offset = ((uint64_t) ts.tv_sec * NS_PER_S) + ts.tv_nsec; // struct timespec to nanosecond
 }
 
 static void init_interbatch_interval_array()
@@ -160,6 +158,104 @@ static u_int16_t get_l3_type(char *pointer)
     return (slb* 256) +lb;
 }
 
+static struct rte_mempool* pckt_buffers_pool;
+
+static struct rte_mbuf** get_pckt_buffer(){
+    void* buffer_pointer = NULL;
+
+    if (rte_mempool_get(pckt_buffers_pool, &buffer_pointer) != 0)
+        return NULL;
+
+    return (struct rte_mbuf**) buffer_pointer;
+}
+
+static void dispose_packets(struct rte_mbuf** buffer, int batch_size){
+    for (int i = 0; i < batch_size; i++) {
+        rte_pktmbuf_free(buffer[i]);
+    }
+    
+    rte_mempool_put(pckt_buffers_pool, buffer);
+}
+
+static void init_pckt_buffer_pool(){
+    pckt_buffers_pool = rte_mempool_create(
+        "PCKT_BUFFERS_POOL",    
+        MAX_CONCURRENT_BATCHES - 1,
+        sizeof(struct rte_mbuf*) * BATCH_SIZE,
+        MAX_CONCURRENT_BATCHES / 4 <= RTE_MEMPOOL_CACHE_MAX_SIZE
+            ? MAX_CONCURRENT_BATCHES / 4
+            : RTE_MEMPOOL_CACHE_MAX_SIZE,
+        0,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        rte_socket_id(),
+        RTE_MEMPOOL_F_SC_GET);
+}
+
+static struct rte_mempool* timestamps_pool;
+
+static uint64_t* get_timestamps_buffer(){
+    void* timestamps_pointer = NULL;
+
+    if (rte_mempool_get(timestamps_pool, &timestamps_pointer) != 0)
+        return NULL;
+
+    return (uint64_t*) timestamps_pointer;
+}
+
+static void init_timestamps_pool(){
+    timestamps_pool = rte_mempool_create(
+            "TIMESTAMPS_POOL",
+            MAX_CONCURRENT_BATCHES - 1,
+            sizeof(uint64_t) * BATCH_SIZE,
+            MAX_CONCURRENT_BATCHES / 4 <= RTE_MEMPOOL_CACHE_MAX_SIZE
+                ? MAX_CONCURRENT_BATCHES / 4
+                : RTE_MEMPOOL_CACHE_MAX_SIZE,
+            0,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            rte_socket_id(),
+            RTE_MEMPOOL_F_SC_GET | RTE_MEMPOOL_F_SP_PUT);
+}
+
+static struct rte_mempool* batch_messages_pool;
+
+static struct batch_queue_message* get_batch_message(){
+    void* batch_message_pointer = NULL;
+
+    if (rte_mempool_get(batch_messages_pool, &batch_message_pointer) != 0)
+        return NULL;
+
+    return (struct batch_queue_message*) batch_message_pointer;
+}
+
+static void dispose_batch(struct batch_queue_message* batch_message){
+    dispose_packets(batch_message->batch, batch_message->batch_size);
+    rte_mempool_put(timestamps_pool, batch_message->packets_timestamps);
+    rte_mempool_put(batch_messages_pool, batch_message);
+}
+
+static void init_batch_message_pool(){
+    batch_messages_pool = rte_mempool_create(
+            "BATCH_MESSAGES_POOL",
+            MAX_CONCURRENT_BATCHES - 1,
+            sizeof(struct batch_queue_message),
+            MAX_CONCURRENT_BATCHES / 4 <= RTE_MEMPOOL_CACHE_MAX_SIZE
+                ? MAX_CONCURRENT_BATCHES / 4
+                : RTE_MEMPOOL_CACHE_MAX_SIZE,
+            0,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            rte_socket_id(),
+            RTE_MEMPOOL_F_SC_GET | RTE_MEMPOOL_F_SP_PUT);
+}
+
 static int lcore_main(__rte_unused void *arg)
 {
     unsigned int lcore_id = rte_lcore_id();
@@ -167,21 +263,24 @@ static int lcore_main(__rte_unused void *arg)
     
     while(!force_quit)
     {
-        struct rte_mbuf** pckt_buffer = (struct rte_mbuf**)rte_malloc(NULL, sizeof(struct rte_mbuf*) * BURST_SIZE, 0);
-        u_int16_t nb_rx = rte_eth_rx_burst(0, 0, pckt_buffer, BURST_SIZE);
+        struct rte_mbuf** pckt_buffer = get_pckt_buffer();
+        if (pckt_buffer == NULL)
+            continue;
+        
+        u_int16_t nb_rx = rte_eth_rx_burst(0, 0, pckt_buffer, BATCH_SIZE);
         
         if (nb_rx <= 0){
-            rte_free(pckt_buffer);
+            dispose_packets(pckt_buffer, 0);
             continue;
         }
         
         uint64_t batch_arrival_timestamp = get_current_timestamp_nsec();
         
         RTE_LOG(INFO, APP, "[lcore_main] - Packets receive in burst %d: %d\n", batch_seq_number, nb_rx);
-
-        RTE_LOG(DEBUG, APP, "[lcore_main] - Allocating message\n");
-        struct batch_queue_message* message = (struct batch_queue_message*)rte_malloc(NULL, sizeof(struct batch_queue_message), 0);
-        RTE_LOG(DEBUG, APP, "[lcore_main] - Message allocated\n");
+        
+        struct batch_queue_message* message = get_batch_message();
+        if (message == NULL)
+            RTE_LOG(ERR, APP, "[lcore_main] - PANIC - Message not retrieved from pool\n");
         
         message->batch_number = batch_seq_number;
         message->batch_size = nb_rx;
@@ -213,9 +312,10 @@ static int lcore_packet_processing(__rte_unused void* arg)
             continue;
 
         RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch dequeue successfully\n");
-
+    
+        uint64_t* pkts_timestamps = get_timestamps_buffer();
         struct batch_queue_message* batch_message = (struct batch_queue_message*) message;
-        uint64_t* pkts_timestamps = (uint64_t*)rte_malloc(NULL, sizeof(uint64_t) * batch_message->batch_size, 0);
+        batch_message->packets_timestamps = pkts_timestamps;
         
         RTE_LOG(INFO, APP, "[lcore_packet_processing] - Batch %d dequeued from ring with %d packets\n", batch_message->batch_number, batch_message->batch_size);
 
@@ -234,8 +334,6 @@ static int lcore_packet_processing(__rte_unused void* arg)
             u_int16_t next_proto = get_l3_type(next_proto_pointer); // holds last two byte value of ETH Layer
             
             if (next_proto == IPV4_PROTO){
-                RTE_LOG(INFO, APP, "[lcore_packet_processing] - IPV4 PACKET ARRIVED\n");
-                
                 struct rte_ipv4_hdr* ipv4_header = rte_pktmbuf_mtod_offset(pkt_buffer, struct rte_ipv4_hdr*, sizeof (struct rte_ether_hdr));
 
                 // BIG-ENDIAN TO LITTLE-ENDIAN (network to host byte order)
@@ -246,8 +344,6 @@ static int lcore_packet_processing(__rte_unused void* arg)
                 ipv4_header->dst_addr = scramble_ip4(ip_dst, 0);
             }
             else if (next_proto == IPV6_PROTO){
-                RTE_LOG(INFO, APP, "[lcore_packet_processing] - IPV6 PACKET ARRIVED\n");
-                
                 struct rte_ipv6_hdr* ipv6_header = rte_pktmbuf_mtod_offset(pkt_buffer, struct rte_ipv6_hdr*, sizeof (struct rte_ether_hdr));
                 uint8_t* ipv6_src_addr = ipv6_header->src_addr.a;
                 uint8_t* ipv6_dst_addr = ipv6_header->dst_addr.a;
@@ -255,7 +351,7 @@ static int lcore_packet_processing(__rte_unused void* arg)
                 struct in6_addr anom_ip_src = {};
                 struct in6_addr anom_ip_dst = {};
                 rte_memcpy(anom_ip_src.s6_addr, ipv6_src_addr, sizeof(ipv6_header->src_addr));
-                rte_memcpy(anom_ip_dst.s6_addr, ipv6_dst_addr, sizeof(sizeof(ipv6_header->dst_addr)));
+                rte_memcpy(anom_ip_dst.s6_addr, ipv6_dst_addr, sizeof(ipv6_header->dst_addr));
 
                 scramble_ip6(&anom_ip_src, 0);
                 scramble_ip6(&anom_ip_dst, 0);
@@ -264,6 +360,9 @@ static int lcore_packet_processing(__rte_unused void* arg)
                 rte_memcpy(ipv6_dst_addr, anom_ip_dst.s6_addr, sizeof(ipv6_header->dst_addr));
             }
         }
+
+        // THIS WILL GET OUT OF HERE WHEN I IMPLEMENT THE RING TO SEND THE PACKETS TO BE PERSISTED
+        dispose_batch(batch_message);
     }
 }
 
@@ -313,6 +412,8 @@ static int lcore_packet_persist(__rte_unused void* args){
         ssize_t packets_persisted = rte_pcapng_write_packets(pcapng, mbufs_persist, batch_message->batch_size);
         if (packets_persisted == -1)
             RTE_LOG(ERR, APP, "[lcore_packet_processing] - Error persistin packets to pcapng file ERRNO %s", rte_strerror(rte_errno));
+
+        dispose_batch(batch_message);
     }
 }
 
@@ -352,6 +453,18 @@ int main(int argc, char **argv)
     if (rte_eth_dev_info_get(port_id, &dev_info) != 0) {
         rte_exit(EXIT_FAILURE, "Failed to get device info for port %u\n", port_id);
     }
+
+    init_pckt_buffer_pool();
+    if (pckt_buffers_pool == NULL)
+        rte_exit(EXIT_FAILURE, "Failed to create packet buffers pool");
+
+    init_batch_message_pool();
+    if (batch_messages_pool == NULL)
+        rte_exit(EXIT_FAILURE, "Failed to create batch messages pool");
+
+    init_timestamps_pool();
+    if (timestamps_pool == NULL)
+        rte_exit(EXIT_FAILURE, "Failed to create timestamps pool");
     
     mbuf_pool_persist = rte_pktmbuf_pool_create("MBUF_POOL_PERSIST",
         NB_MBUFS,
@@ -394,12 +507,11 @@ int main(int argc, char **argv)
 
     RTE_LOG(INFO, APP, "FD NUMBER %d\n", fd);
 
-    batches_queue = rte_ring_create("BATCHES_RING", 32, rte_socket_id(), RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
+    batches_queue = rte_ring_create("BATCHES_RING", BATCHES_QUEUE_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_MC_HTS_DEQ);
     int key_created = scramble_init_from_file("config/anom.key", SCRAMBLE_BLOWFISH, SCRAMBLE_BLOWFISH, 0);
     if (key_created < 0)
         rte_exit(EXIT_FAILURE, "ERROR CREATING cryptopANT key");
     
-
     signal(SIGTERM, gracefully_shutdown);
     signal(SIGINT, gracefully_shutdown);
 

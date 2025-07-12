@@ -10,6 +10,8 @@
 struct batch_queue_message{
     int batch_number;
     int batch_size;
+    uint64_t* packets_timestamps;
+    uint64_t timestamp_nsec;
     struct rte_mbuf** batch;
 };
 
