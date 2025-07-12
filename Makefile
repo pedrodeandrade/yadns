@@ -25,6 +25,8 @@ all: shared
 .PHONY: shared static static-debug
 shared: build/$(APP)-shared
 	ln -sf $(APP)-shared build/$(APP)
+shared-debug: build/$(APP)-shared-debug
+	ln -sf $(APP)-shared-debug build/$(APP)
 static: build/$(APP)-static
 	ln -sf $(APP)-static build/$(APP)
 static-debug: build/$(APP)-static-debug
@@ -63,6 +65,9 @@ CFLAGS_DEBUG += -DALLOW_EXPERIMENTAL_API
 build/$(APP)-shared: $(SRCS-y) $(HDRS-y) Makefile $(PC_FILE) | build
 	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_SHARED)
 
+build/$(APP)-shared-debug: $(SRCS-y) $(HDRS-y) Makefile $(PC_FILE) | build
+	$(CC) $(CFLAGS_DEBUG) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_SHARED)
+
 build/$(APP)-static: $(SRCS-y) $(HDRS-y) Makefile $(PC_FILE) | build
 	$(CC) $(CFLAGS) $(SRCS-y) -o $@ $(LDFLAGS) $(LDFLAGS_STATIC)
 
@@ -74,7 +79,7 @@ build:
 
 .PHONY: clean
 clean:
-	rm -f build/$(APP) build/$(APP)-static build/$(APP)-shared build/$(APP)-static-debug
+	rm -f build/$(APP) build/$(APP)-static build/$(APP)-shared build/$(APP)-static-debug build/$(APP)-shared-debug
 	test -d build && rmdir -p build || true
 
 # --- MODIFICATION START ---
