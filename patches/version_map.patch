@@ -10,7 +10,7 @@ diff --git a/lib/pcapng/version.map b/lib/pcapng/version.map
  	rte_pcapng_fdopen;
  	rte_pcapng_mbuf_size;
  	rte_pcapng_write_packets;
-+	rte_pcapng_write_packets_with_timestamp;
++	rte_pcapng_write_packets_with_timestamps;
  	rte_pcapng_write_stats;
  
  	local: *;
